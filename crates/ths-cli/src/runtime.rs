@@ -149,7 +149,15 @@ pub struct Runtime {
 
 struct FaucetJournal {
     path: PathBuf,
-    _lock: File,
+    lock: File,
+}
+
+impl Drop for FaucetJournal {
+    fn drop(&mut self) {
+        if let Err(error) = self.lock.unlock() {
+            eprintln!("could not unlock faucet intents: {error:#}");
+        }
+    }
 }
 
 impl FaucetJournal {
@@ -172,7 +180,7 @@ impl FaucetJournal {
         }
         Ok(Self {
             path: instance_dir.join("faucet-intents.json"),
-            _lock: lock,
+            lock,
         })
     }
 
@@ -2600,6 +2608,20 @@ mod tests {
                 "volume rm ths-alpha-wallet",
                 "network rm owned-network",
             ]
+        );
+    }
+
+    #[test]
+    fn dropping_the_journal_releases_a_lock_shared_with_a_spawned_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = FaucetJournal::open(dir.path()).unwrap();
+        let inherited = journal.lock.try_clone().unwrap();
+        drop(journal);
+        let reopened = FaucetJournal::open(dir.path());
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "a copy of the lock descriptor kept the journal locked after it was dropped"
         );
     }
 
