@@ -795,7 +795,7 @@ impl RealWallet {
         not(test),
         expect(
             dead_code,
-            reason = "server-owned payment progression (#196) repairs from this"
+            reason = "wallet journal lookup is retained for diagnostics and tests"
         )
     )]
     pub async fn prepared(&self, activity_id: &str) -> Result<Option<PreparedPayment>> {
