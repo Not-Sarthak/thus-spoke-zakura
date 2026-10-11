@@ -444,7 +444,10 @@ async fn progress_activity_inner(
     }
     let result = tokio::time::timeout_at(deadline, async {
         match submit_prepared(&state.0.store, state, &activity).await? {
-            PreparedSubmission::Broadcast(activity) => confirm_after_mining(state, activity).await,
+            // The request path owns regtest auto-mining. Background recovery
+            // must observe chain progress, not mine another block while
+            // reconciling a previously accepted payment.
+            PreparedSubmission::Broadcast(activity) => confirm_from_chain(state, activity).await,
             PreparedSubmission::Expired(_) => Ok(activity.clone()),
         }
     })
@@ -622,8 +625,9 @@ async fn progress_address_faucet_inner(
     }
     let result = tokio::time::timeout_at(deadline, async {
         match submit_address_prepared(&state.0.store, state, &payment).await? {
+            // As with ordinary sends, recovery should not create blocks.
             AddressSubmission::Broadcast(payment) => {
-                confirm_address_after_mining(state, payment).await
+                confirm_address_from_chain(state, payment).await
             }
             AddressSubmission::Expired(_) => Ok(payment.clone()),
         }
@@ -1290,6 +1294,32 @@ async fn confirm_address_after_mining(
                 error = %format_args!("{error:#}"),
                 txid = %pending.txid,
                 "could not check address faucet confirmation"
+            );
+            Ok(pending)
+        }
+    }
+}
+
+async fn confirm_address_from_chain(
+    state: &AppState,
+    pending: AddressFaucet,
+) -> anyhow::Result<AddressFaucet> {
+    if pending.status == "confirmed" {
+        return Ok(pending);
+    }
+    match state.0.rpc.transaction(&pending.txid).await {
+        Ok(tx) => match confirmed_block_hash(&tx) {
+            Some(hash) => state
+                .0
+                .store
+                .confirm_address(&pending.id, &pending.txid, hash),
+            None => Ok(pending),
+        },
+        Err(error) => {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                txid = %pending.txid,
+                "could not check address faucet confirmation during recovery"
             );
             Ok(pending)
         }
