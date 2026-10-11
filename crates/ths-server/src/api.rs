@@ -32,8 +32,8 @@ use zcash_protocol::{consensus::COINBASE_MATURITY_BLOCKS, memo::MemoBytes, value
 
 use crate::{
     db::{
-        Account, Activity, AddressFaucet, IdempotencyConflict, PreparedTransaction, Store,
-        TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC,
+        Account, Activity, ActivityIntent, AddressFaucet, AddressFaucetIntent, IdempotencyConflict,
+        PreparedTransaction, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC,
     },
     mining::{
         Admission, MiningAdmissionError, MiningCoordinator, MiningJob, MiningRuntime, MiningState,
@@ -289,6 +289,9 @@ const PAYMENT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn payment_confirmation_loop(state: AppState) {
     let mut cursor = None;
+    let mut activity_cursor = None;
+    let mut address_cursor = None;
+    let mut activity_first = true;
     let mut interval = tokio::time::interval(PAYMENT_RETRY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -307,7 +310,407 @@ pub async fn payment_confirmation_loop(state: AppState) {
                 "background payment confirmation failed"
             ),
         }
+        if state.started() {
+            let deadline = Instant::now() + PAYMENT_DISPATCH_BUDGET;
+            if let Err(error) = progress_prepared_payments(
+                &state,
+                &mut activity_cursor,
+                &mut address_cursor,
+                &mut activity_first,
+                deadline,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "payment progression pass failed"
+                );
+            }
+        }
     }
+}
+
+async fn progress_prepared_payments(
+    state: &AppState,
+    activity_cursor: &mut Option<String>,
+    address_cursor: &mut Option<String>,
+    activity_first: &mut bool,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    if Instant::now() >= deadline {
+        return Ok(());
+    }
+    let mut activity = state
+        .0
+        .store
+        .unresolved_activities_page(activity_cursor.as_deref(), 1)?
+        .pop();
+    if activity.is_none() {
+        *activity_cursor = None;
+    }
+    let mut faucet = state
+        .0
+        .store
+        .unresolved_address_faucets_page(address_cursor.as_deref(), 1)?
+        .pop();
+    if faucet.is_none() {
+        *address_cursor = None;
+    }
+
+    let first_attempt = (Instant::now() + PAYMENT_LOOKUP_TIMEOUT).min(deadline);
+    if *activity_first {
+        if let Some(intent) = activity.take() {
+            *activity_cursor = Some(intent.activity.id.clone());
+            dispatch_activity(state, &intent, first_attempt).await;
+        }
+        if Instant::now() < deadline
+            && let Some(intent) = faucet.take()
+        {
+            *address_cursor = Some(intent.payment.id.clone());
+            let attempt_deadline = (Instant::now() + PAYMENT_LOOKUP_TIMEOUT).min(deadline);
+            dispatch_address_faucet(state, &intent, attempt_deadline).await;
+        }
+    } else {
+        if let Some(intent) = faucet.take() {
+            *address_cursor = Some(intent.payment.id.clone());
+            dispatch_address_faucet(state, &intent, first_attempt).await;
+        }
+        if Instant::now() < deadline
+            && let Some(intent) = activity.take()
+        {
+            *activity_cursor = Some(intent.activity.id.clone());
+            let attempt_deadline = (Instant::now() + PAYMENT_LOOKUP_TIMEOUT).min(deadline);
+            dispatch_activity(state, &intent, attempt_deadline).await;
+        }
+    }
+    *activity_first = !*activity_first;
+    Ok(())
+}
+
+async fn dispatch_activity(state: &AppState, intent: &ActivityIntent, deadline: Instant) {
+    let Ok(guard) = tokio::time::timeout_at(deadline, state.0.payments.lock()).await else {
+        return;
+    };
+    if let Err(error) = progress_activity(state, intent, deadline).await {
+        tracing::warn!(
+            error = %format_args!("{error:#}"),
+            activity = %intent.activity.id,
+            "accepted payment remains pending"
+        );
+    }
+    drop(guard);
+}
+
+async fn progress_activity(
+    state: &AppState,
+    intent: &ActivityIntent,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let key = &intent.key;
+    let before = state.0.store.activity_for_key(key)?;
+    let result = progress_activity_inner(state, intent, deadline).await;
+    if let Err(error) = &result {
+        record_activity_progression_error(state, key, error)?;
+    }
+    let after = state.0.store.activity_for_key(key)?;
+    if before != after {
+        notify(state, "wallet");
+    }
+    result
+}
+
+async fn progress_activity_inner(
+    state: &AppState,
+    intent: &ActivityIntent,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let key = &intent.key;
+    let Some(activity) = state.0.store.activity_for_key(key)? else {
+        return Ok(());
+    };
+    if activity.status == "preparing" {
+        if state
+            .0
+            .store
+            .expired_activity_retry(&activity.id)?
+            .is_some()
+        {
+            return prepare_expired_activity(state, intent, &activity, deadline).await;
+        }
+        return Ok(());
+    }
+    if !matches!(activity.status.as_str(), "prepared" | "broadcast") {
+        return Ok(());
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        match submit_prepared(&state.0.store, state, &activity).await? {
+            // The request path owns regtest auto-mining. Background recovery
+            // must observe chain progress, not mine another block while
+            // reconciling a previously accepted payment.
+            PreparedSubmission::Broadcast(activity) => confirm_from_chain(state, activity).await,
+            PreparedSubmission::Expired(_) => Ok(activity.clone()),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("payment submission exceeded the progression deadline"))
+    .and_then(|result| result);
+    result.map(|_| ())
+}
+
+fn record_activity_progression_error(
+    state: &AppState,
+    key: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    if let Some(activity) = state.0.store.activity_for_key(key)?
+        && !matches!(activity.status.as_str(), "confirmed" | "failed")
+    {
+        state.0.store.record_error(
+            &activity.id,
+            &activity.status,
+            &activity.txid,
+            &format!("{error:#}"),
+        )?;
+    }
+    Ok(())
+}
+
+async fn prepare_expired_activity(
+    state: &AppState,
+    intent: &ActivityIntent,
+    activity: &Activity,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        activity.id == intent.activity.id,
+        "activity intent changed during recovery"
+    );
+    tokio::time::timeout_at(deadline, async {
+        let retry = state
+            .0
+            .store
+            .expired_activity_retry(&activity.id)?
+            .context("activity has no persisted expiry proof to authorize replacement")?;
+        state.synchronize_latest().await?;
+        let height = state.0.rpc.chain_info().await?.blocks;
+        anyhow::ensure!(
+            retry.expiry_height > 0 && height >= retry.expiry_height,
+            "original transaction has not yet reached its expiry height"
+        );
+        anyhow::ensure!(
+            !state.0.rpc.transaction_known(&retry.txid).await?,
+            "original transaction is still known to the node"
+        );
+        let seed = state.0.store.seed()?;
+        let prepared = match activity.kind.as_str() {
+            "send" => {
+                let from = activity
+                    .from_account
+                    .context("send activity has no source account")?;
+                let destination = state.0.store.account(activity.to_account)?;
+                let address = match activity.destination_pool.as_str() {
+                    "transparent" => destination.transparent_address,
+                    "ironwood" => destination.unified_address,
+                    pool => anyhow::bail!("send activity has unsupported destination pool {pool}"),
+                };
+                let memo = parse_memo(intent.memo.as_deref(), &activity.destination_pool)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                state
+                    .0
+                    .wallet
+                    .prepare(
+                        Some(&activity.id),
+                        &seed,
+                        from,
+                        &activity.source_pool,
+                        &address,
+                        activity.amount_zatoshi,
+                        memo,
+                    )
+                    .await?
+            }
+            "faucet" => {
+                let destination = state.0.store.account(activity.to_account)?;
+                let address = match activity.destination_pool.as_str() {
+                    "transparent" => destination.transparent_address,
+                    "ironwood" => destination.unified_address,
+                    pool => {
+                        anyhow::bail!("faucet activity has unsupported destination pool {pool}")
+                    }
+                };
+                let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+                let _replenishment = state.0.treasury_replenishment.lock().await;
+                prepare_with_replenishment(
+                    state,
+                    Some(&activity.id),
+                    &seed,
+                    &treasury,
+                    &address,
+                    activity.amount_zatoshi,
+                )
+                .await?
+            }
+            kind => anyhow::bail!("activity has unsupported recovery kind {kind}"),
+        };
+        if retry.txid == prepared.txid {
+            anyhow::bail!("wallet returned the expired transaction instead of a replacement");
+        }
+        state.0.store.record_prepared(
+            &activity.id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("expired payment replacement preparation exceeded the progression deadline")
+    })?
+}
+
+async fn progress_address_faucet(
+    state: &AppState,
+    intent: &AddressFaucetIntent,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let key = &intent.key;
+    let before = state.0.store.address_faucet_for_key(key)?;
+    let result = progress_address_faucet_inner(state, intent, deadline).await;
+    if let Err(error) = &result {
+        record_address_progression_error(state, key, error)?;
+    }
+    let after = state.0.store.address_faucet_for_key(key)?;
+    if before != after {
+        notify(state, "wallet");
+    }
+    result
+}
+
+async fn dispatch_address_faucet(
+    state: &AppState,
+    intent: &AddressFaucetIntent,
+    deadline: Instant,
+) {
+    let Ok(guard) = tokio::time::timeout_at(deadline, state.0.payments.lock()).await else {
+        return;
+    };
+    if let Err(error) = progress_address_faucet(state, intent, deadline).await {
+        tracing::warn!(
+            error = %format_args!("{error:#}"),
+            payment = %intent.payment.id,
+            "accepted address faucet remains pending"
+        );
+    }
+    drop(guard);
+}
+
+async fn progress_address_faucet_inner(
+    state: &AppState,
+    intent: &AddressFaucetIntent,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let key = &intent.key;
+    let Some(payment) = state.0.store.address_faucet_for_key(key)? else {
+        return Ok(());
+    };
+    if payment.status == "preparing" {
+        if state.0.store.expired_payment_retry(&payment.id)?.is_some() {
+            return prepare_expired_address_faucet(state, intent, &payment, deadline).await;
+        }
+        return Ok(());
+    }
+    if !matches!(payment.status.as_str(), "prepared" | "broadcast") {
+        return Ok(());
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        match submit_address_prepared(&state.0.store, state, &payment).await? {
+            // As with ordinary sends, recovery should not create blocks.
+            AddressSubmission::Broadcast(payment) => {
+                confirm_address_from_chain(state, payment).await
+            }
+            AddressSubmission::Expired(_) => Ok(payment.clone()),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("address faucet submission exceeded the progression deadline"))
+    .and_then(|result| result);
+    result.map(|_| ())
+}
+
+fn record_address_progression_error(
+    state: &AppState,
+    key: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    if let Some(payment) = state.0.store.address_faucet_for_key(key)?
+        && !matches!(payment.status.as_str(), "confirmed" | "failed")
+    {
+        state.0.store.record_address_error(
+            &payment.id,
+            &payment.status,
+            &payment.txid,
+            &format!("{error:#}"),
+        )?;
+    }
+    Ok(())
+}
+
+async fn prepare_expired_address_faucet(
+    state: &AppState,
+    intent: &AddressFaucetIntent,
+    payment: &AddressFaucet,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        payment.id == intent.payment.id,
+        "address faucet intent changed during recovery"
+    );
+    tokio::time::timeout_at(deadline, async {
+        let retry = state
+            .0
+            .store
+            .expired_payment_retry(&payment.id)?
+            .context("address faucet has no persisted expiry proof to authorize replacement")?;
+        state.synchronize_latest().await?;
+        let height = state.0.rpc.chain_info().await?.blocks;
+        anyhow::ensure!(
+            retry.expiry_height > 0 && height >= retry.expiry_height,
+            "original transaction has not yet reached its expiry height"
+        );
+        anyhow::ensure!(
+            !state.0.rpc.transaction_known(&retry.txid).await?,
+            "original transaction is still known to the node"
+        );
+        let seed = state.0.store.seed()?;
+        let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+        let _replenishment = state.0.treasury_replenishment.lock().await;
+        let prepared = prepare_with_replenishment(
+            state,
+            Some(&payment.id),
+            &seed,
+            &treasury,
+            &payment.address,
+            payment.amount_zatoshi,
+        )
+        .await?;
+        if retry.txid == prepared.txid {
+            anyhow::bail!("wallet returned the expired transaction instead of a replacement");
+        }
+        state.0.store.record_address_prepared(
+            &payment.id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "expired address faucet replacement preparation exceeded the progression deadline"
+        )
+    })?
 }
 
 /// Serves the dashboard shell for client-side routes only.
@@ -806,6 +1209,11 @@ async fn fund_address_from_treasury(
                 }
             }
             "preparing" => {
+                if state.0.store.expired_payment_retry(&pending.id)?.is_some() {
+                    anyhow::bail!(
+                        "address faucet is awaiting background verification before replacement"
+                    );
+                }
                 let prepared = async {
                     state.synchronize_latest().await?;
                     let seed = state.0.store.seed()?;
@@ -892,6 +1300,32 @@ async fn confirm_address_after_mining(
     }
 }
 
+async fn confirm_address_from_chain(
+    state: &AppState,
+    pending: AddressFaucet,
+) -> anyhow::Result<AddressFaucet> {
+    if pending.status == "confirmed" {
+        return Ok(pending);
+    }
+    match state.0.rpc.transaction(&pending.txid).await {
+        Ok(tx) => match confirmed_block_hash(&tx) {
+            Some(hash) => state
+                .0
+                .store
+                .confirm_address(&pending.id, &pending.txid, hash),
+            None => Ok(pending),
+        },
+        Err(error) => {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                txid = %pending.txid,
+                "could not check address faucet confirmation during recovery"
+            );
+            Ok(pending)
+        }
+    }
+}
+
 async fn fund_from_treasury(
     state: &AppState,
     account_id: u8,
@@ -934,6 +1368,7 @@ async fn fund_from_treasury(
 trait PaymentLifecycle: Sync {
     async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission>;
     async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()>;
+    fn has_expired_payment_retry(&self, id: &str) -> anyhow::Result<bool>;
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity>;
     async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity>;
 }
@@ -946,6 +1381,10 @@ impl PaymentLifecycle for AppState {
 
     async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
         discard_unprepared_claim(self, id).await
+    }
+
+    fn has_expired_payment_retry(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self.0.store.expired_activity_retry(id)?.is_some())
     }
 
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
@@ -982,6 +1421,9 @@ where
                 PreparedSubmission::Expired(activity) => pending = activity,
             },
             "preparing" => {
+                if runtime.has_expired_payment_retry(&pending.id)? {
+                    anyhow::bail!("payment is awaiting background verification before replacement");
+                }
                 let prepared = match prepare(pending.id.clone()).await {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -3125,6 +3567,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_payment_recovery_keeps_claims_and_records_retryable_errors() {
+        let (state, _dir) = state_with_local_wallet();
+        state
+            .0
+            .store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "unprepared", None)
+            .unwrap();
+        let prepared = state
+            .0
+            .store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 13_000, "prepared", None)
+            .unwrap();
+        state
+            .0
+            .store
+            .record_prepared(&prepared.id, "unknown-txid", b"signed transaction", 0)
+            .unwrap();
+        let address = state
+            .0
+            .store
+            .claim_address_faucet("tm-external", 14_000, "address-prepared")
+            .unwrap();
+        state
+            .0
+            .store
+            .record_address_prepared(
+                &address.id,
+                "unknown-address-txid",
+                b"signed address transaction",
+                0,
+            )
+            .unwrap();
+
+        let mut activity_cursor = None;
+        let mut address_cursor = None;
+        let mut activity_first = true;
+        let mut events = state.0.events.subscribe();
+        for _ in 0..2 {
+            progress_prepared_payments(
+                &state,
+                &mut activity_cursor,
+                &mut address_cursor,
+                &mut activity_first,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        }
+
+        let unprepared = state
+            .0
+            .store
+            .activity_for_key("unprepared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unprepared.status, "preparing");
+        assert!(unprepared.last_error.is_none());
+
+        let prepared = state.0.store.activity_for_key("prepared").unwrap().unwrap();
+        assert_eq!(prepared.status, "prepared");
+        assert!(
+            !prepared
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+
+        let address = state
+            .0
+            .store
+            .address_faucet_for_key("address-prepared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(address.status, "prepared");
+        assert!(!address.last_error.as_deref().unwrap_or_default().is_empty());
+        assert_eq!(events.try_recv().unwrap(), "wallet");
+        assert_eq!(events.try_recv().unwrap(), "wallet");
+    }
+
+    #[tokio::test]
+    async fn expired_activity_and_address_faucet_recovery_preserve_claims() {
+        let (state, _dir) = state_with_local_wallet();
+        let activity = state
+            .0
+            .store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 13_000, "expired-send", None)
+            .unwrap();
+        state
+            .0
+            .store
+            .record_prepared(&activity.id, "expired-send-txid", b"old send", 1)
+            .unwrap();
+        state
+            .0
+            .store
+            .reset_for_retry(&activity.id, "expired-send-txid")
+            .unwrap();
+
+        let address = state
+            .0
+            .store
+            .claim_address_faucet("tm-expired", 14_000, "expired-address")
+            .unwrap();
+        state
+            .0
+            .store
+            .record_address_prepared(
+                &address.id,
+                "expired-address-txid",
+                b"old address payment",
+                1,
+            )
+            .unwrap();
+        state
+            .0
+            .store
+            .reset_address_for_retry(&address.id, "expired-address-txid")
+            .unwrap();
+
+        state
+            .0
+            .store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 15_000, "clean-claim", None)
+            .unwrap();
+        let mut activity_cursor = None;
+        let mut address_cursor = None;
+        let mut activity_first = true;
+        for _ in 0..8 {
+            progress_prepared_payments(
+                &state,
+                &mut activity_cursor,
+                &mut address_cursor,
+                &mut activity_first,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        }
+
+        let recovered_activity = state
+            .0
+            .store
+            .activity_for_key("expired-send")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_activity.id, activity.id);
+        assert_eq!(recovered_activity.status, "preparing");
+        assert!(recovered_activity.txid.is_empty());
+        assert!(
+            recovered_activity
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("127.0.0.1:1"))
+        );
+        assert_eq!(
+            state.0.store.expired_activity_retry(&activity.id).unwrap(),
+            Some(crate::db::ExpiredPaymentRetry {
+                txid: "expired-send-txid".into(),
+                expiry_height: 1,
+            })
+        );
+        assert_eq!(
+            state
+                .0
+                .store
+                .claim_transfer(1, 2, "ironwood", "ironwood", 13_000, "expired-send", None)
+                .unwrap()
+                .id,
+            activity.id
+        );
+
+        let recovered_address = state
+            .0
+            .store
+            .address_faucet_for_key("expired-address")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_address.id, address.id);
+        assert_eq!(recovered_address.status, "preparing");
+        assert!(recovered_address.txid.is_empty());
+        assert!(
+            recovered_address
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("127.0.0.1:1"))
+        );
+        assert_eq!(
+            state.0.store.expired_payment_retry(&address.id).unwrap(),
+            Some(crate::db::ExpiredPaymentRetry {
+                txid: "expired-address-txid".into(),
+                expiry_height: 1,
+            })
+        );
+
+        let clean_claim = state
+            .0
+            .store
+            .activity_for_key("clean-claim")
+            .unwrap()
+            .unwrap();
+        assert_eq!(clean_claim.status, "preparing");
+        assert!(clean_claim.last_error.is_none());
+        assert_eq!(
+            state
+                .0
+                .store
+                .expired_activity_retry(&clean_claim.id)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn status_counts_accounts_without_reading_the_seed() {
         let (state, dir) = state_with_local_wallet();
         rusqlite::Connection::open(dir.path().join("server.db"))
@@ -3445,6 +4101,10 @@ mod tests {
         async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
             self.discarded.lock().unwrap().push(id.to_owned());
             self.store.discard_preparing(id)
+        }
+
+        fn has_expired_payment_retry(&self, id: &str) -> anyhow::Result<bool> {
+            Ok(self.store.expired_activity_retry(id)?.is_some())
         }
 
         fn record_prepared(
@@ -3863,7 +4523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payment_lifecycle_prepares_again_after_expiry() {
+    async fn payment_lifecycle_defers_repreparation_until_proof_check() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = lifecycle_claim(&store, "expired-replay");
@@ -3883,12 +4543,91 @@ mod tests {
                 std::future::ready(Ok(prepared_payment_result("replacement-txid", 180)))
             }
         })
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(result.status, "confirmed");
-        assert_eq!(result.txid, "replacement-txid");
-        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert!(result.is_err());
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .store
+                .expired_activity_retry(&claim.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(runtime.discarded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_key_send_retry_defers_while_expiry_proof_is_pending() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "same-key-expired-send");
+        store
+            .record_prepared(&claim.id, "expired-send-txid", b"expired", 140)
+            .unwrap();
+        store
+            .reset_for_retry(&claim.id, "expired-send-txid")
+            .unwrap();
+        let replay = lifecycle_claim(&store, "same-key-expired-send");
+        assert_eq!(replay.id, claim.id);
+
+        let runtime = RecordingPaymentLifecycle::new(store.clone(), []);
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let result = execute_payment(&runtime, replay, {
+            let prepare_calls = prepare_calls.clone();
+            move |_| {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(prepared_payment_result("unsafe-replacement", 180)))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert!(runtime.discarded.lock().unwrap().is_empty());
+        assert!(store.expired_activity_retry(&claim.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn same_key_external_faucet_retry_defers_while_expiry_proof_is_pending() {
+        let (state, _dir) = state_with_local_wallet();
+        let claim = state
+            .0
+            .store
+            .claim_address_faucet("tm-same-key", 14_000, "same-key-expired-faucet")
+            .unwrap();
+        state
+            .0
+            .store
+            .record_address_prepared(&claim.id, "expired-faucet-txid", b"expired", 140)
+            .unwrap();
+        state
+            .0
+            .store
+            .reset_address_for_retry(&claim.id, "expired-faucet-txid")
+            .unwrap();
+
+        let result =
+            fund_address_from_treasury(&state, "tm-same-key", 14_000, "same-key-expired-faucet")
+                .await;
+
+        assert!(result.is_err());
+        let replay = state
+            .0
+            .store
+            .address_faucet_for_key("same-key-expired-faucet")
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.id, claim.id);
+        assert_eq!(replay.status, "preparing");
+        assert!(
+            state
+                .0
+                .store
+                .expired_payment_retry(&claim.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

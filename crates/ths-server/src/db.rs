@@ -88,13 +88,6 @@ pub struct AddressFaucet {
     pub last_error: Option<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "server-owned payment progression (#196) uses this"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityIntent {
     pub activity: Activity,
@@ -102,13 +95,6 @@ pub struct ActivityIntent {
     pub memo: Option<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "server-owned payment progression (#196) uses this"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressFaucetIntent {
     pub payment: AddressFaucet,
@@ -118,6 +104,12 @@ pub struct AddressFaucetIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTransaction {
     pub raw_transaction: Vec<u8>,
+    pub expiry_height: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredPaymentRetry {
+    pub txid: String,
     pub expiry_height: u64,
 }
 
@@ -152,6 +144,10 @@ impl Store {
             CREATE TABLE IF NOT EXISTS prepared_payments (
                 activity_id TEXT PRIMARY KEY, raw_transaction BLOB NOT NULL,
                 expiry_height INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS payment_expiry_retries (
+                activity_id TEXT PRIMARY KEY, txid TEXT NOT NULL,
+                expiry_height INTEGER NOT NULL CHECK(expiry_height > 0)
             );
             CREATE TABLE IF NOT EXISTS address_faucets (
                 key TEXT PRIMARY KEY, id TEXT UNIQUE NOT NULL, address TEXT NOT NULL,
@@ -276,6 +272,26 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn unresolved_activities_page(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ActivityIntent>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ACTIVITY_COLUMNS},i.key,i.memo FROM activity a JOIN idempotency i ON i.activity_id=a.id WHERE a.status NOT IN ('confirmed','failed') AND (?1 IS NULL OR a.id > ?1) ORDER BY a.id ASC LIMIT ?2"
+        ))?;
+        Ok(query
+            .query_map(params![after_id, limit.clamp(1, 64) as i64], |row| {
+                Ok(ActivityIntent {
+                    activity: row_activity(row)?,
+                    key: row.get(12)?,
+                    memo: row.get(13)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -290,6 +306,25 @@ impl Store {
         ))?;
         Ok(query
             .query_map([], |row| {
+                Ok(AddressFaucetIntent {
+                    payment: row_address_faucet(row)?,
+                    key: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn unresolved_address_faucets_page(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AddressFaucetIntent>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ADDRESS_FAUCET_COLUMNS},key FROM address_faucets WHERE status NOT IN ('confirmed','failed') AND (?1 IS NULL OR id > ?1) ORDER BY id ASC LIMIT ?2"
+        ))?;
+        Ok(query
+            .query_map(params![after_id, limit.clamp(1, 64) as i64], |row| {
                 Ok(AddressFaucetIntent {
                     payment: row_address_faucet(row)?,
                     key: row.get(7)?,
@@ -403,10 +438,19 @@ impl Store {
     }
 
     pub fn discard_address_preparing(&self, id: &str) -> Result<()> {
-        self.0.lock().unwrap().execute(
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction()?;
+        if tx.execute(
             "DELETE FROM address_faucets WHERE id=?1 AND status='preparing'",
             [id],
-        )?;
+        )? == 1
+        {
+            tx.execute(
+                "DELETE FROM payment_expiry_retries WHERE activity_id=?1",
+                [id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -437,6 +481,10 @@ impl Store {
             "INSERT INTO prepared_payments(activity_id,raw_transaction,expiry_height) VALUES(?1,?2,?3) ON CONFLICT(activity_id) DO NOTHING",
             params![id, raw_transaction, expiry_height],
         )?;
+        tx.execute(
+            "DELETE FROM payment_expiry_retries WHERE activity_id=?1",
+            [id],
+        )?;
         tx.commit()?;
         Ok(payment)
     }
@@ -444,15 +492,48 @@ impl Store {
     pub fn reset_address_for_retry(&self, id: &str, txid: &str) -> Result<AddressFaucet> {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
+        let prepared_expiry = tx
+            .query_row(
+                "SELECT expiry_height FROM prepared_payments WHERE activity_id=?1",
+                [id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
         if tx.execute(
-            "UPDATE address_faucets SET txid='',block_hash=NULL,status='preparing' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            "UPDATE address_faucets SET txid='',block_hash=NULL,status='preparing',last_error=NULL WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
             params![id, txid],
         )? == 1 {
+            let expiry_height = prepared_expiry.context("expired payment has no persisted expiry height")?;
+            if expiry_height == 0 {
+                bail!("cannot retry a payment without a known expiry height");
+            }
+            tx.execute(
+                "INSERT INTO payment_expiry_retries(activity_id,txid,expiry_height) VALUES(?1,?2,?3) ON CONFLICT(activity_id) DO UPDATE SET txid=excluded.txid,expiry_height=excluded.expiry_height",
+                params![id, txid, expiry_height],
+            )?;
             tx.execute("DELETE FROM prepared_payments WHERE activity_id=?1", [id])?;
         }
         let payment = address_by_id(&tx, id)?;
         tx.commit()?;
         Ok(payment)
+    }
+
+    pub fn expired_payment_retry(&self, id: &str) -> Result<Option<ExpiredPaymentRetry>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT txid,expiry_height FROM payment_expiry_retries WHERE activity_id=?1",
+                [id],
+                |row| {
+                    Ok(ExpiredPaymentRetry {
+                        txid: row.get(0)?,
+                        expiry_height: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn mark_address_broadcast(&self, id: &str, txid: &str) -> Result<AddressFaucet> {
@@ -480,13 +561,6 @@ impl Store {
         address_by_id(&db, id)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn record_address_error(
         &self,
         id: &str,
@@ -522,13 +596,6 @@ impl Store {
         Ok(payment)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn record_error(
         &self,
         id: &str,
@@ -573,6 +640,10 @@ impl Store {
         )? == 1
         {
             tx.execute("DELETE FROM idempotency WHERE activity_id=?1", [id])?;
+            tx.execute(
+                "DELETE FROM payment_expiry_retries WHERE activity_id=?1",
+                [id],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -605,6 +676,10 @@ impl Store {
             "INSERT INTO prepared_payments(activity_id,raw_transaction,expiry_height) VALUES(?1,?2,?3) ON CONFLICT(activity_id) DO NOTHING",
             params![id, raw_transaction, expiry_height],
         )?;
+        tx.execute(
+            "DELETE FROM payment_expiry_retries WHERE activity_id=?1",
+            [id],
+        )?;
         tx.commit()?;
         Ok(activity)
     }
@@ -629,16 +704,36 @@ impl Store {
     pub fn reset_for_retry(&self, id: &str, txid: &str) -> Result<Activity> {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
+        let prepared_expiry = tx
+            .query_row(
+                "SELECT expiry_height FROM prepared_payments WHERE activity_id=?1",
+                [id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
         let updated = tx.execute(
-            "UPDATE activity SET txid='',block_hash=NULL,status='preparing' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            "UPDATE activity SET txid='',block_hash=NULL,status='preparing',last_error=NULL WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
             params![id, txid],
         )?;
         if updated == 1 {
+            let expiry_height =
+                prepared_expiry.context("expired payment has no persisted expiry height")?;
+            if expiry_height == 0 {
+                bail!("cannot retry a payment without a known expiry height");
+            }
+            tx.execute(
+                "INSERT INTO payment_expiry_retries(activity_id,txid,expiry_height) VALUES(?1,?2,?3) ON CONFLICT(activity_id) DO UPDATE SET txid=excluded.txid,expiry_height=excluded.expiry_height",
+                params![id, txid, expiry_height],
+            )?;
             tx.execute("DELETE FROM prepared_payments WHERE activity_id=?1", [id])?;
         }
         let activity = activity_by_id(&tx, id)?;
         tx.commit()?;
         Ok(activity)
+    }
+
+    pub fn expired_activity_retry(&self, id: &str) -> Result<Option<ExpiredPaymentRetry>> {
+        self.expired_payment_retry(id)
     }
 
     pub fn mark_broadcast(&self, id: &str, txid: &str) -> Result<Activity> {
@@ -1428,8 +1523,72 @@ mod tests {
 
         assert_eq!(retry.status, "preparing");
         assert!(retry.txid.is_empty());
+        assert_eq!(
+            store.expired_activity_retry(&claim.id).unwrap(),
+            Some(ExpiredPaymentRetry {
+                txid: "expired-txid".into(),
+                expiry_height: 140,
+            })
+        );
         assert!(store.prepared_transaction(&claim.id).is_err());
         assert_eq!(store.activities(10).unwrap(), [retry]);
+
+        let replacement = store
+            .record_prepared(&claim.id, "replacement-txid", b"replacement", 180)
+            .unwrap();
+        assert_eq!(replacement.txid, "replacement-txid");
+        assert_eq!(store.expired_activity_retry(&claim.id).unwrap(), None);
+    }
+
+    #[test]
+    fn discarding_expired_activity_claim_removes_its_retry_marker() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_transfer(
+                1,
+                2,
+                "ironwood",
+                "ironwood",
+                12_000,
+                "discard-expired",
+                None,
+            )
+            .unwrap();
+        store
+            .record_prepared(&claim.id, "expired-txid", b"signed transaction", 140)
+            .unwrap();
+        store.reset_for_retry(&claim.id, "expired-txid").unwrap();
+
+        store.discard_preparing(&claim.id).unwrap();
+
+        assert!(store.activity_for_key("discard-expired").unwrap().is_none());
+        assert_eq!(store.expired_activity_retry(&claim.id).unwrap(), None);
+    }
+
+    #[test]
+    fn discarding_expired_address_faucet_removes_its_retry_marker() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_address_faucet("tm-discard-expired", 12_000, "discard-expired-faucet")
+            .unwrap();
+        store
+            .record_address_prepared(&claim.id, "expired-txid", b"signed transaction", 140)
+            .unwrap();
+        store
+            .reset_address_for_retry(&claim.id, "expired-txid")
+            .unwrap();
+
+        store.discard_address_preparing(&claim.id).unwrap();
+
+        assert!(
+            store
+                .address_faucet_for_key("discard-expired-faucet")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.expired_payment_retry(&claim.id).unwrap(), None);
     }
 
     #[test]
@@ -1790,6 +1949,39 @@ mod tests {
                     key: "address-prepared".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn unresolved_intent_pages_are_bounded_and_resume_after_the_last_id() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let first = store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 1_000, "page-one", None)
+            .unwrap();
+        let second = store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 2_000, "page-two", None)
+            .unwrap();
+        let third = store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 3_000, "page-three", None)
+            .unwrap();
+        let mut expected = [first.id, second.id, third.id];
+        expected.sort();
+
+        let mut cursor = None;
+        for id in expected {
+            let page = store
+                .unresolved_activities_page(cursor.as_deref(), 1)
+                .unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].activity.id, id);
+            cursor = Some(page[0].activity.id.clone());
+        }
+        assert!(
+            store
+                .unresolved_activities_page(cursor.as_deref(), 1)
+                .unwrap()
+                .is_empty()
         );
     }
 
